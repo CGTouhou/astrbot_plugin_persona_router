@@ -1,0 +1,194 @@
+{
+  "enabled": {
+    "description": "启用人格路由",
+    "type": "bool",
+    "default": true,
+    "hint": "关闭后本插件不做任何事，完全走 AstrBot 原生行为。"
+  },
+  "default_persona_id": {
+    "description": "默认人格",
+    "type": "string",
+    "default": "",
+    "hint": "没命中任何规则时用这个人格。留空则用规则列表里的第一个人格。",
+    "_special": "select_persona"
+  },
+  "selector_enabled": {
+    "description": "让 AI 判断该用哪个人格",
+    "type": "bool",
+    "default": true,
+    "hint": "开启：关键词没命中时，用一个小模型读消息判断。关闭：只靠关键词，零延迟零消耗。"
+  },
+  "selector_provider_id": {
+    "description": "判断用的模型",
+    "type": "string",
+    "default": "",
+    "hint": "建议选轻量快速模型。留空则用当前会话的模型（注意：留空不等于关闭判断）。",
+    "_special": "select_provider"
+  },
+  "cache_ttl": {
+    "description": "判断结果复用条数",
+    "type": "int",
+    "default": 3,
+    "hint": "同一会话连续 N 条消息复用上一次判断，到数才重新判断。推荐 2-4：越大越省调用，但人格切换越迟钝。设 1 = 每条都判断（最准）。"
+  },
+  "selector_context_limit": {
+    "description": "判断时参考几条最近消息",
+    "type": "int",
+    "default": 3,
+    "hint": "给判断模型看的上下文条数，用来区分「在骂机器人」还是「在聊别人」。0 = 只看当前这条，推荐 3-5。"
+  },
+  "selector_timeout_seconds": {
+    "description": "判断超时（秒）",
+    "type": "int",
+    "default": 8,
+    "hint": "超时就直接用默认人格，不会卡住回复。范围 1-120，推荐 5-10。"
+  },
+  "isolate_context": {
+    "description": "每个人格独立记忆",
+    "type": "bool",
+    "default": true,
+    "hint": "开启（推荐）：每个人格一条独立对话，切换人格就是切换聊天记录。关闭：所有人格共用一条对话，由本插件把选中人格叠加或替换到默认人格上。"
+  },
+  "inject_mode": {
+    "description": "人格叠加方式（仅关闭隔离时生效）",
+    "type": "string",
+    "default": "replace",
+    "hint": "replace（推荐）：只保留选中人格，说话风格最纯粹；代价是技能说明和工具调用约定会一起丢掉。prepend：选中人格叠在默认人格前面，两张卡共存，技能说明保留。",
+    "options": [
+      "replace",
+      "prepend"
+    ]
+  },
+  "inherit_history": {
+    "description": "开关隔离时带上已有聊天记录",
+    "type": "bool",
+    "default": true,
+    "hint": "切换模式时，如果目标对话是空的，就把当前记录复制过去，避免突然失忆。"
+  },
+  "claim_legacy_conversation": {
+    "description": "接管已有对话",
+    "type": "bool",
+    "default": true,
+    "hint": "第一次启用时，把会话里原有的对话直接给默认人格用，保留之前的聊天记录。"
+  },
+  "reset_all_personas": {
+    "description": "/reset 清空全部人格的记录",
+    "type": "bool",
+    "default": true,
+    "hint": "开启：/reset 清掉这个会话下所有人格的聊天记录。关闭：只清当前人格那条。"
+  },
+  "diagnose_prompt": {
+    "description": "打印调试日志",
+    "type": "bool",
+    "default": true,
+    "hint": "每条消息记录一次人格和技能是否正常注入，排查问题时打开，平时可以关掉。"
+  },
+  "session_filter_mode": {
+    "description": "生效范围",
+    "type": "string",
+    "default": "disabled",
+    "hint": "全部会话 / 只对列表里的会话生效 / 列表里的会话不生效。",
+    "options": [
+      "disabled",
+      "whitelist",
+      "blacklist"
+    ]
+  },
+  "session_filter_list": {
+    "description": "生效范围列表",
+    "type": "list",
+    "default": [],
+    "hint": "填群号或 QQ 号，一行一个。"
+  },
+  "selector_prompt_extra": {
+    "description": "自定义判断偏好",
+    "type": "text",
+    "default": "",
+    "hint": "追加给判断模型的补充说明，比如「这个人格只在群里用，私聊不要切」。"
+  },
+  "persona_rules": {
+    "description": "人格规则",
+    "type": "template_list",
+    "hint": "每条规则描述一个人格，以及什么情况下该切到它。",
+    "templates": {
+      "persona_rule": {
+        "name": "人格规则",
+        "hint": "选人格、写描述、写触发场景",
+        "items": {
+          "rule_enabled": {
+            "description": "启用这条规则",
+            "type": "bool",
+            "default": true
+          },
+          "persona_id": {
+            "description": "用哪个人格",
+            "type": "string",
+            "default": "",
+            "hint": "从 AstrBot 人格管理里选一个。",
+            "_special": "select_persona"
+          },
+          "provider_id": {
+            "description": "这个规则用哪个模型",
+            "type": "string",
+            "default": "",
+            "hint": "留空则跟随当前会话的模型。",
+            "_special": "select_provider"
+          },
+          "persona_desc": {
+            "description": "这个人格是什么样",
+            "type": "text",
+            "default": "",
+            "hint": "给判断模型看的一句话简介，不是人格卡本身。"
+          },
+          "scenario_desc": {
+            "description": "什么时候切到它",
+            "type": "text",
+            "default": "",
+            "hint": "写清楚什么消息该切、什么消息不该切。判断模型主要靠这一段，写得越具体越准。"
+          },
+          "trigger_keywords": {
+            "description": "关键词触发（支持正则）",
+            "type": "list",
+            "default": [],
+            "hint": "命中就立刻切到这个人格、不调模型。写普通词是包含匹配，也支持正则如「(启动|开启)模式」。留空则只靠 AI 判断。"
+          },
+          "duration_seconds": {
+            "description": "触发后持续几秒",
+            "type": "int",
+            "default": 0,
+            "hint": "只对关键词触发有效。0 = 只影响这一条消息；大于 0 = 这段时间内一直用它，到期自动切回默认人格。推荐 60-300（1-5 分钟）。"
+          },
+          "rule_isolate": {
+            "description": "隔离方式",
+            "type": "string",
+            "default": "inherit",
+            "hint": "inherit：跟随全局开关。on：这个人格独占一条对话。off：这个人格跟大家共用一条对话。",
+            "options": [
+              "inherit",
+              "on",
+              "off"
+            ]
+          },
+          "rule_mode": {
+            "description": "叠加方式",
+            "type": "string",
+            "default": "inherit",
+            "hint": "inherit：跟随全局设置。prepend：叠在默认人格前面。replace：替换整段。仅在共用对话时生效。",
+            "options": [
+              "inherit",
+              "prepend",
+              "replace"
+            ]
+          }
+        }
+      }
+    },
+    "default": []
+  },
+  "refresh_on_repeat": {
+    "description": "关键词重复触发时重新计时",
+    "type": "bool",
+    "default": false,
+    "hint": "关闭（默认）：同一个人格再次命中关键词，剩余时间不变。开启：每命中一次重新计时。"
+  }
+}

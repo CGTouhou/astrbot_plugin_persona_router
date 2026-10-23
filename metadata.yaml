@@ -1,0 +1,16 @@
+name: astrbot_plugin_persona_router
+display_name: 动态人格（增强）
+desc: 让 AI 根据聊天内容自动切换人格，每个人格都有独立的聊天记录。
+short_desc: 按内容自动切换人格，人格之间记忆互不干扰
+version: v2.5.0
+author: CGTouhou
+author_url: https://github.com/CGTouhou
+repo: https://github.com/CGTouhou/astrbot_plugin_persona_router
+support_platforms:
+  - aiocqhttp
+  - qq_official
+astrbot_version: ">=4.29.0"
+tags:
+  - 人格
+  - 上下文
+  - 多角色

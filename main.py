@@ -937,6 +937,40 @@ class PersonaRouterPlugin(Star):
             logger.warning("[PersonaRouter] 读取历史失败: %s", exc)
             return []
 
+    @staticmethod
+    def _history_as_list(history: Any) -> list[Any]:
+        """
+        把 Conversation.history 统一解成 list。
+
+        AstrBot 的 Conversation.history 是 JSON 字符串，而 update_conversation
+        把传进来的 history 直接写进 JSON 列、不会先 dump 一次。把字符串原样
+        传回去会变成双重编码：库里存的是 '"[]"'，下次 json.loads 一次拿到的
+        还是 str。插件这边有 isinstance 兜底，会静默当成空历史；AstrBot 那边
+        读到 str 直接丢进 req.contexts 则会报错。所以搬历史前一律过这里。
+        """
+        if isinstance(history, list):
+            return history
+        if not isinstance(history, str):
+            return []
+        text = history.strip()
+        if not text:
+            return []
+        try:
+            parsed = json.loads(text)
+        except (TypeError, ValueError):
+            return []
+        if isinstance(parsed, list):
+            return parsed
+        # 兜底：库里已经存了双重编码的脏数据，再解一层
+        if isinstance(parsed, str):
+            try:
+                parsed = json.loads(parsed)
+            except (TypeError, ValueError):
+                return []
+            if isinstance(parsed, list):
+                return parsed
+        return []
+
     def _record_timeline(self, umo: str, role: str, text: str, persona_id: str = "") -> None:
         """往内存时间线追加一条消息，超出上限自动丢最旧的。"""
         # 纯关键词模式不会调用 Selector，这份时间线没人读，别白占内存
@@ -1256,6 +1290,25 @@ class PersonaRouterPlugin(Star):
         if curr_cid:
             current = await conv_mgr.get_conversation(umo, curr_cid)
             if current is not None and self._conversation_belongs(current, persona_id):
+                # /new 建出来的对话会继承当前人格的 persona_id（AstrBot 的
+                # _get_current_persona_id 直接返回 conv.persona_id），但没有
+                # title。补上铭牌，否则它在插件眼里是「主对话」，插件退场时
+                # _release_umo_binding 会把它当候选，把会话指针拨来拨去。
+                if not (current.title or "").strip():
+                    try:
+                        await conv_mgr.update_conversation(
+                            umo, current.cid, title=f"[{persona_id}]"
+                        )
+                        current.title = f"[{persona_id}]"
+                        logger.info(
+                            "[PersonaRouter] 补齐对话铭牌 persona=%s cid=%s",
+                            persona_id,
+                            str(current.cid)[:8],
+                        )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        logger.warning("[PersonaRouter] 补齐对话铭牌失败: %s", exc)
                 return current
         conversations = await conv_mgr.get_conversations(umo)
         matched = [c for c in conversations if self._conversation_belongs(c, persona_id)]
@@ -1278,6 +1331,14 @@ class PersonaRouterPlugin(Star):
             candidate = None
             if legacy and (not default_pid or persona_id == default_pid):
                 candidate = max(legacy, key=lambda c: c.updated_at or 0)
+            if candidate is None and legacy:
+                # 空的无主对话（用户刚发过 /new、或手动建了没聊天的对话）
+                # 没有历史可丢，任何人格都能收编。否则本次会另建一条
+                # `[人格名]`，这条空对话留在列表里当孤儿，插件退场时
+                # _release_umo_binding 还会按 updated_at 把它选成主对话。
+                empty_legacy = [c for c in legacy if not self._history_as_list(c.history)]
+                if empty_legacy:
+                    candidate = max(empty_legacy, key=lambda c: c.updated_at or 0)
             if candidate is not None:
                 await conv_mgr.update_conversation(umo, candidate.cid, persona_id=persona_id)
                 candidate.persona_id = persona_id
@@ -1298,18 +1359,17 @@ class PersonaRouterPlugin(Star):
         if self.config.get("inherit_history", True) and curr_cid:
             try:
                 current = await conv_mgr.get_conversation(umo, curr_cid)
-                if (
-                    current is not None
-                    and (current.title or "").strip() == _SHARED_TITLE
-                    and current.history
-                    and current.history.strip() not in ("", "[]")
-                ):
-                    await conv_mgr.update_conversation(umo, cid, history=current.history)
-                    logger.info(
-                        "[PersonaRouter] 人格对话继承共享历史 persona=%s cid=%s",
-                        persona_id,
-                        str(cid)[:8],
-                    )
+                if current is not None and (current.title or "").strip() == _SHARED_TITLE:
+                    inherited = self._history_as_list(current.history)
+                    if inherited:
+                        # 注意必须传 list：update_conversation 直接把 history
+                        # 写进 JSON 列，传字符串会被二次编码。
+                        await conv_mgr.update_conversation(umo, cid, history=inherited)
+                        logger.info(
+                            "[PersonaRouter] 人格对话继承共享历史 persona=%s cid=%s",
+                            persona_id,
+                            str(cid)[:8],
+                        )
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -1340,9 +1400,27 @@ class PersonaRouterPlugin(Star):
         """
         conv_mgr = self.context.conversation_manager
         curr_cid = await conv_mgr.get_curr_conversation_id(umo)
+        current = None
         if curr_cid:
             current = await conv_mgr.get_conversation(umo, curr_cid)
             if current is not None and (current.title or "").strip() == _SHARED_TITLE:
+                return current
+            # 用户发了 /new：AstrBot 建的是无 title、无 persona 的空对话。
+            # 如果直接回去找旧的 [共享]，这条空对话就变成孤儿，`/new` 等于没
+            # 生效；而且插件退场时 _release_umo_binding 会按 updated_at 把它
+            # 选中，用户以为历史被清了。空对话没有历史可丢，就地收编。
+            if (
+                current is not None
+                and not (current.title or "").strip()
+                and not (current.persona_id or "").strip()
+                and not self._history_as_list(current.history)
+            ):
+                await conv_mgr.update_conversation(umo, current.cid, title=_SHARED_TITLE)
+                current.title = _SHARED_TITLE
+                logger.info(
+                    "[PersonaRouter] 收编空对话为共享对话 cid=%s",
+                    str(current.cid)[:8],
+                )
                 return current
         conversations = await conv_mgr.get_conversations(umo)
         # 只认 title 是 [共享] 的那条。不能按「persona_id 为空」来认——
@@ -1353,13 +1431,13 @@ class PersonaRouterPlugin(Star):
             return max(shared, key=lambda c: c.updated_at or 0)
         # 第一次进入非隔离模式：把当前对话的历史搬进共享对话，
         # 否则从隔离切过来的瞬间等于失忆。
-        inherited_history = ""
+        inherited_history: list[Any] = []
         if self.config.get("inherit_history", True) and curr_cid:
             try:
-                current = await conv_mgr.get_conversation(umo, curr_cid)
-                if current is not None and current.history:
-                    if current.history.strip() not in ("", "[]"):
-                        inherited_history = current.history
+                if current is None:
+                    current = await conv_mgr.get_conversation(umo, curr_cid)
+                if current is not None:
+                    inherited_history = self._history_as_list(current.history)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -1371,6 +1449,8 @@ class PersonaRouterPlugin(Star):
         )
         if inherited_history:
             try:
+                # 必须传 list 而不是 conversation.history 字符串：后者会被
+                # update_conversation 二次编码进 JSON 列，历史就废了。
                 await conv_mgr.update_conversation(umo, cid, history=inherited_history)
             except asyncio.CancelledError:
                 raise

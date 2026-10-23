@@ -52,12 +52,13 @@ import re
 import sqlite3
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from astrbot.api import AstrBotConfig, logger, sp
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.provider import ProviderRequest
-from astrbot.api.star import Context, Star, register
+from astrbot.api.star import Context, Star, StarTools, register
 
 _SELECTOR_TIMEOUT_SECONDS = 8
 _MAX_CACHE_SIZE = 1024
@@ -68,6 +69,14 @@ _MAX_CACHE_SIZE = 1024
 # 才能做到跨人格连续、不重复、不解析几十万字符的 JSON。
 _TIMELINE_MAX = 30
 _TIMELINE_TEXT_LIMIT = 300
+# 长期运行保护：最多保留多少个会话、多久没更新就丢、写盘防抖延迟
+_TIMELINE_UMO_LIMIT = 256
+_TIMELINE_TTL_SECONDS = 7 * 86400
+_TIMELINE_SAVE_DELAY = 3.0
+# AstrBot 会把 [MSG_ID:...] 和 <system_reminder>...</system_reminder> 拼进
+# message_str，这些元信息对判断人格没有意义，进时间线前先剔掉。
+_RE_MSG_ID = re.compile(r"\[MSG_ID:-?\d+\]")
+_RE_SYSTEM_REMINDER = re.compile(r"<system_reminder>[\s\S]*?(?:</system_reminder>|$)")
 
 # 路由状态：本插件自己写、自己读，不依赖其它插件
 _ROUTER_STATE_KEY = "persona_router_state"
@@ -158,7 +167,7 @@ class CachedDecision:
     "astrbot_plugin_persona_router",
     "CGTouhou",
     "按聊天内容自动切换人格，每个人格各自拥有独立的聊天记录。",
-    "v2.5.0",
+    "2.5.2",
 )
 class PersonaRouterPlugin(Star):
     """动态人格增强：自动选人格 + 人格上下文隔离。"""
@@ -170,8 +179,9 @@ class PersonaRouterPlugin(Star):
         self._locks: dict[str, asyncio.Lock] = {}
         # 关键词触发后的持续状态：umo -> {"persona_id", "expires_at", "rule"}
         self._activations: dict[str, dict[str, Any]] = {}
-        # Selector 上下文用的内存时间线：umo -> [{"role", "text", "persona"}]
-        self._timeline: dict[str, list[dict[str, str]]] = {}
+        # Selector 上下文时间线：umo -> {"items": [{"role", "text", "persona"}], "updated": ts}
+        self._timeline: dict[str, dict[str, Any]] = {}
+        self._timeline_save_task: asyncio.Task | None = None
 
     async def initialize(self):
         rules = self._get_active_rules()
@@ -207,6 +217,8 @@ class PersonaRouterPlugin(Star):
                 "[PersonaRouter] 以下人格在 AstrBot 里不存在，对应规则会退化: %s",
                 "、".join(missing),
             )
+        # 把上次的时间线读回来，重启后 Selector 不会从零开始
+        await self._load_timeline()
         # 启动对账：把上次接管过、这次配置改成不再管辖的会话解绑，
         # 否则那些会话的人格会卡在插件最后写下的 persona_id 上。
         await self._reconcile_bindings()
@@ -284,6 +296,9 @@ class PersonaRouterPlugin(Star):
         本插件的 Selector 调用走 context.llm_generate()，不经过
         MainAgentHooks.on_agent_done，所以不会被这个钩子捕获、不会污染时间线。
         """
+        # 不归本插件管的会话不记时间线，省内存也省得污染判断
+        if not self._should_run(event):
+            return
         text = (getattr(response, "completion_text", "") or "").strip()
         if not text:
             return
@@ -404,8 +419,11 @@ class PersonaRouterPlugin(Star):
                 # 原生什么都没拼（没配全局人格），叠了个寂寞，算一层
                 req.system_prompt = block
                 layers = 1
-            elif prompt in base:
-                # 原生注入的已经是同一个人格，再叠就重复了
+            elif block in base:
+                # 原生注入的已经是同一个人格，再叠就重复了。
+                # 用完整 block 判断而不是裸 prompt：不同人格的 prompt 可能
+                # 互为子串（比如都写了「你是一个助手」），裸 prompt 会误判成
+                # 同一个人格而漏掉注入，那比重复叠加更糟。
                 logger.debug("[PersonaRouter] 选中人格与原生人格相同，跳过叠加")
                 layers = 0
             else:
@@ -866,9 +884,9 @@ class PersonaRouterPlugin(Star):
         if umo not in self._timeline:
             await self._prime_timeline(event, umo)
             if umo not in self._timeline:
-                # 全新会话没有历史可预热。放个空列表占位，表示「已经试过」，
+                # 全新会话没有历史可预热。放个空桶占位，表示「已经试过」，
                 # 否则之后每一轮都会白白去读一次历史。
-                self._timeline[umo] = []
+                self._timeline[umo] = {"items": [], "updated": 0.0}
         lines = self._timeline_lines(umo, limit)
         if lines:
             return "\n".join(lines)
@@ -895,7 +913,8 @@ class PersonaRouterPlugin(Star):
             # 用存在性判断而不是直接赋值：_read_history 里有 await，会让出
             # 事件循环，这期间可能已经有新消息记进时间线了，直接赋值会冲掉。
             if umo not in self._timeline:
-                self._timeline[umo] = bucket
+                self._timeline[umo] = {"items": bucket, "updated": time.time()}
+                self._schedule_timeline_save()
                 logger.info("[PersonaRouter] 时间线冷启动，载入 %d 条历史", len(bucket))
 
     async def _read_history(self, event: AstrMessageEvent) -> list[Any]:
@@ -923,19 +942,26 @@ class PersonaRouterPlugin(Star):
         # 纯关键词模式不会调用 Selector，这份时间线没人读，别白占内存
         if not self.config.get("selector_enabled", True):
             return
-        text = " ".join((text or "").split())
+        text = self._clean_text(text)
         if not text:
             return
         if len(text) > _TIMELINE_TEXT_LIMIT:
             text = text[:_TIMELINE_TEXT_LIMIT] + "…"
-        bucket = self._timeline.setdefault(umo, [])
-        bucket.append({"role": role, "text": text, "persona": persona_id or ""})
-        if len(bucket) > _TIMELINE_MAX:
-            del bucket[: len(bucket) - _TIMELINE_MAX]
+        bucket = self._timeline.get(umo)
+        if bucket is None:
+            bucket = {"items": [], "updated": 0.0}
+            self._timeline[umo] = bucket
+        items = bucket["items"]
+        items.append({"role": role, "text": text, "persona": persona_id or ""})
+        if len(items) > _TIMELINE_MAX:
+            del items[: len(items) - _TIMELINE_MAX]
+        bucket["updated"] = time.time()
+        self._prune_timeline()
+        self._schedule_timeline_save()
 
     def _timeline_lines(self, umo: str, limit: int) -> list[str]:
         """把时间线末尾 limit 条渲染成「用户: ...」形式，机器人带人格名。"""
-        bucket = self._timeline.get(umo) or []
+        bucket = (self._timeline.get(umo) or {}).get("items") or []
         if not bucket:
             return []
         lines: list[str] = []
@@ -950,6 +976,131 @@ class PersonaRouterPlugin(Star):
                 label = f"机器人（{persona}）" if persona else "机器人"
                 lines.append(f"{label}: {text}")
         return lines
+
+    @staticmethod
+    def _clean_text(text: str) -> str:
+        """剔掉 AstrBot 拼进来的元信息，只留用户真正说的话。"""
+        if not text:
+            return ""
+        cleaned = _RE_SYSTEM_REMINDER.sub(" ", text)
+        cleaned = _RE_MSG_ID.sub(" ", cleaned)
+        return " ".join(cleaned.split())
+
+    # ---------------- 时间线持久化 ----------------
+
+    def _timeline_file(self) -> Path:
+        """时间线落盘位置：data/plugin_data/<插件名>/timeline.json。"""
+        try:
+            base = StarTools.get_data_dir("astrbot_plugin_persona_router")
+        except Exception:
+            base = Path("data") / "plugin_data" / "astrbot_plugin_persona_router"
+        return Path(base) / "timeline.json"
+
+    async def _load_timeline(self) -> None:
+        """启动时把上次的时间线读回来，重启后 Selector 判断不会断档。"""
+        path = self._timeline_file()
+        if not path.exists():
+            return
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("[PersonaRouter] 读取时间线失败，忽略: %s", exc)
+            return
+        if not isinstance(raw, dict):
+            return
+        now = time.time()
+        loaded = 0
+        for umo, payload in raw.items():
+            if not isinstance(payload, dict):
+                continue
+            items = payload.get("items")
+            try:
+                updated = float(payload.get("updated") or 0)
+            except (TypeError, ValueError):
+                updated = 0.0
+            if not isinstance(items, list) or not items:
+                continue
+            if now - updated > _TIMELINE_TTL_SECONDS:
+                continue
+            clean: list[dict[str, str]] = []
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                text = self._clean_text(str(item.get("text") or ""))
+                if not text:
+                    continue
+                if len(text) > _TIMELINE_TEXT_LIMIT:
+                    text = text[:_TIMELINE_TEXT_LIMIT] + "…"
+                clean.append(
+                    {
+                        "role": item.get("role") or "user",
+                        "text": text,
+                        "persona": item.get("persona") or "",
+                    }
+                )
+            if not clean:
+                continue
+            self._timeline[str(umo)] = {
+                "items": clean[-_TIMELINE_MAX:],
+                "updated": updated or now,
+            }
+            loaded += 1
+        self._prune_timeline()
+        if loaded:
+            logger.info("[PersonaRouter] 时间线已恢复 %d 个会话", loaded)
+
+    def _prune_timeline(self) -> None:
+        """丢掉过期会话；会话数超上限时丢最久没更新的。"""
+        now = time.time()
+        for umo, bucket in list(self._timeline.items()):
+            if now - float(bucket.get("updated") or 0) > _TIMELINE_TTL_SECONDS:
+                self._timeline.pop(umo, None)
+        overflow = len(self._timeline) - _TIMELINE_UMO_LIMIT
+        if overflow > 0:
+            ordered = sorted(self._timeline.items(), key=lambda kv: float(kv[1].get("updated") or 0))
+            for umo, _ in ordered[:overflow]:
+                self._timeline.pop(umo, None)
+        # 时间线里已经没了的会话，它的锁也一起收掉，避免长期运行后无限堆积
+        for umo in [k for k in self._locks if k not in self._timeline]:
+            self._locks.pop(umo, None)
+
+    def _schedule_timeline_save(self, delay: float = _TIMELINE_SAVE_DELAY) -> None:
+        """防抖写盘：短时间内的多次改动只写一次，避免每条消息都碰磁盘。"""
+        if self._timeline_save_task and not self._timeline_save_task.done():
+            return
+        try:
+            self._timeline_save_task = asyncio.create_task(self._save_timeline_later(delay))
+        except RuntimeError:
+            self._timeline_save_task = None
+
+    async def _save_timeline_later(self, delay: float) -> None:
+        await asyncio.sleep(delay)
+        await self._save_timeline()
+
+    async def _save_timeline(self) -> None:
+        """原子写：先写临时文件再替换，避免写到一半留下坏文件。"""
+        path = self._timeline_file()
+        now = time.time()
+        payload: dict[str, Any] = {}
+        for umo, bucket in self._timeline.items():
+            items = bucket.get("items") or []
+            if not items:
+                continue
+            updated = float(bucket.get("updated") or now)
+            if now - updated > _TIMELINE_TTL_SECONDS:
+                continue
+            payload[umo] = {"items": items[-_TIMELINE_MAX:], "updated": updated}
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+            tmp.replace(path)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("[PersonaRouter] 保存时间线失败: %s", exc)
 
     def _extract_message_text(self, content: Any) -> str:
         """从 history 的 content 里抽纯文本，兼容字符串和分段列表两种形态。"""
@@ -966,7 +1117,7 @@ class PersonaRouterPlugin(Star):
             text = " ".join(parts)
         else:
             return ""
-        text = " ".join(text.split())
+        text = self._clean_text(text)
         if len(text) > 300:
             text = text[:300] + "…"
         return text
@@ -1447,6 +1598,8 @@ class PersonaRouterPlugin(Star):
             activation_text = f"{activation.get('persona_id')}（还剩 {remain} 秒）"
         else:
             activation_text = "无"
+        timeline_bucket = self._timeline.get(event.unified_msg_origin) or {}
+        timeline_count = len(timeline_bucket.get("items") or [])
         lines = [
             "人格路由状态",
             f"enabled: {self.config.get('enabled', True)}",
@@ -1457,10 +1610,10 @@ class PersonaRouterPlugin(Star):
             f"inherit_history: {self.config.get('inherit_history', True)}",
             f"selector_enabled: {self.config.get('selector_enabled', True)}"
             + ("（纯关键词模式）" if not self.config.get("selector_enabled", True) else ""),
-            f"selector_provider_id: {self.config.get('selector_provider_id', '') or 'follow-session'}",
+            f"selector_provider_id: {self.config.get('selector_provider_id') or 'follow-session'}",
             f"selector_context_limit: {self.config.get('selector_context_limit', 3)}",
             f"selector_timeout: {self._selector_timeout_seconds():.1f}s",
-            f"时间线: {len(self._timeline.get(event.unified_msg_origin) or [])} 条（内存，跨人格）",
+            f"时间线: {timeline_count} 条（跨人格，落盘）",
             f"cache_ttl: {cache_ttl}",
             f"关键词激活: {activation_text}",
             f"cache: {cache_text}",
@@ -1525,7 +1678,10 @@ class PersonaRouterPlugin(Star):
         """清掉当前会话的关键词激活状态和 Selector 时间线。用法：/dp clear"""
         umo = event.unified_msg_origin
         removed = self._activations.pop(umo, None)
-        timeline_count = len(self._timeline.pop(umo, []) or [])
+        cleared = self._timeline.pop(umo, None)
+        timeline_count = len((cleared or {}).get("items") or [])
+        if cleared:
+            await self._save_timeline()
         parts = []
         if removed:
             parts.append(f"关键词激活（原人格：{removed.get('persona_id')}）")
@@ -1618,6 +1774,22 @@ class PersonaRouterPlugin(Star):
         覆盖不到的情况：强制杀进程、whitelist 排除——这两种要用 /dp restore。
         """
         self._persona_cache.clear()
+        # 取消还没到点的延迟写盘任务，避免退出时留下 pending task
+        if self._timeline_save_task and not self._timeline_save_task.done():
+            self._timeline_save_task.cancel()
+            try:
+                await self._timeline_save_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
+            self._timeline_save_task = None
+        try:
+            await self._save_timeline()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("[PersonaRouter] terminate 保存时间线失败: %s", exc)
         try:
             released, total = await self._release_persona_bindings()
             logger.info(

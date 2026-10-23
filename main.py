@@ -1294,7 +1294,11 @@ class PersonaRouterPlugin(Star):
                 # _get_current_persona_id 直接返回 conv.persona_id），但没有
                 # title。补上铭牌，否则它在插件眼里是「主对话」，插件退场时
                 # _release_umo_binding 会把它当候选，把会话指针拨来拨去。
-                if not (current.title or "").strip():
+                # 只补空对话：有历史的主对话要继续保持无标题，退场时靠
+                # title 为空把它认出来，把指针拨回去。
+                if not (current.title or "").strip() and not self._history_as_list(
+                    current.history
+                ):
                     try:
                         await conv_mgr.update_conversation(
                             umo, current.cid, title=f"[{persona_id}]"
@@ -1329,6 +1333,7 @@ class PersonaRouterPlugin(Star):
             # 聊天记录就被它端走了，之后判回默认人格反而要新建空对话。
             default_pid = str(self.config.get("default_persona_id") or "").strip()
             candidate = None
+            candidate_is_empty = False
             if legacy and (not default_pid or persona_id == default_pid):
                 candidate = max(legacy, key=lambda c: c.updated_at or 0)
             if candidate is None and legacy:
@@ -1339,9 +1344,18 @@ class PersonaRouterPlugin(Star):
                 empty_legacy = [c for c in legacy if not self._history_as_list(c.history)]
                 if empty_legacy:
                     candidate = max(empty_legacy, key=lambda c: c.updated_at or 0)
+                    candidate_is_empty = True
             if candidate is not None:
-                await conv_mgr.update_conversation(umo, candidate.cid, persona_id=persona_id)
+                # 空对话顺手补上铭牌：否则它 title 仍为空，插件退场时
+                # _release_umo_binding 会把它当成「主对话」候选，把会话指针
+                # 拨到一条刚认领的空对话上。
+                new_title = f"[{persona_id}]" if candidate_is_empty else None
+                await conv_mgr.update_conversation(
+                    umo, candidate.cid, persona_id=persona_id, title=new_title
+                )
                 candidate.persona_id = persona_id
+                if new_title:
+                    candidate.title = new_title
                 logger.info(
                     "[PersonaRouter] 认领旧对话 persona=%s cid=%s",
                     persona_id,

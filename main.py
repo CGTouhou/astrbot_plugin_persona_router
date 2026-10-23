@@ -167,7 +167,7 @@ class CachedDecision:
     "astrbot_plugin_persona_router",
     "CGTouhou",
     "按聊天内容自动切换人格，每个人格各自拥有独立的聊天记录。",
-    "2.5.2",
+    "2.5.3",
 )
 class PersonaRouterPlugin(Star):
     """动态人格增强：自动选人格 + 人格上下文隔离。"""
@@ -1400,7 +1400,14 @@ class PersonaRouterPlugin(Star):
         group_id = event.get_group_id() or ""
         sender_id = event.get_sender_id() or ""
         session_id = event.message_obj.session_id if event.message_obj else ""
-        hit = any(fid in (group_id, sender_id, session_id) for fid in targets) or any(
+        # 群聊里只认群号，不认发送者：否则黑名单里填一个 QQ 号，这个人
+        # 在哪个群说话，哪个群就会被整群排除。发送者 ID 只在私聊参与匹配。
+        if group_id:
+            candidates = {group_id, session_id}
+        else:
+            candidates = {sender_id, session_id}
+        candidates.discard("")
+        hit = any(fid in candidates for fid in targets) or any(
             umo == t or umo.endswith(":" + t) for t in targets
         )
         return hit if mode == "whitelist" else not hit

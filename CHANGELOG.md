@@ -1,14 +1,14 @@
 # 更新日志
 
-## v2.5.6
-
-### 变更
-
-- 版本号递进至 `2.5.6`。`2.5.5` 已发布使用，本版以 `2.5.6` 重新发布
+## v2.5.7
 
 ### 修复
 
 - 解绑人格不再直连数据库。`_unbind_persona` 原先通过 `conversation_manager.db.db_path` 自己开 `sqlite3` 连接执行 `UPDATE conversations SET persona_id = NULL`，还带一条 `LIKE` 模糊兜底。现在改走 `update_conversation(persona_id=null())` 公开接口：`null()` 不是 `None`，能穿过实现里 `if persona_id is not None` 的拦截，由 AstrBot 自己的 ORM 生成同样的 `SET persona_id = NULL`。结果与原来一致，但全程不碰数据库连接、不依赖内部属性、也没有模糊更新，顺带修掉了同步 `sqlite3.connect(timeout=30)` 阻塞事件循环的隐患
+
+### 说明
+
+- `v2.5.6` 未通过上架审核、没有对外发布过，本版取代它
 
 
 ## v2.5.5

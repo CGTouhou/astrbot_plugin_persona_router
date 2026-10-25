@@ -2,7 +2,7 @@ name: astrbot_plugin_persona_router
 display_name: 动态人格（增强）
 desc: 让 AI 根据聊天内容自动切换人格，每个人格都有独立的聊天记录。
 short_desc: 按内容自动切换人格，人格之间记忆互不干扰
-version: 2.5.6
+version: 2.5.7
 author: CGTouhou
 social_link: https://github.com/CGTouhou
 repo: https://github.com/CGTouhou/astrbot_plugin_persona_router

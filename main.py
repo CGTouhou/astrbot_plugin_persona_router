@@ -49,7 +49,6 @@ import asyncio
 import copy
 import json
 import re
-import sqlite3
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -59,6 +58,7 @@ from astrbot.api import AstrBotConfig, logger, sp
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star, StarTools, register
+from sqlalchemy import null
 
 _SELECTOR_TIMEOUT_SECONDS = 8
 _MAX_CACHE_SIZE = 1024
@@ -1508,32 +1508,26 @@ class PersonaRouterPlugin(Star):
 
     # ---------------- 人格绑定解绑 ----------------
 
-    def _unbind_persona(self, cid: str) -> bool:
-        """把一条对话的 persona_id 清成 NULL。
+    async def _unbind_persona(self, umo: str, cid: str) -> bool:
+        """把一条对话的 persona_id 清成 NULL（等价于 AstrBot 的「回落全局人格」）。
 
-        AstrBot 的 update_conversation 只在 persona_id 非 None 时才写库，写不了
-        NULL；而 persona_id 留空字符串又会被 resolve_selected_persona 当成
-        「无人格」而不是「回落全局」。所以这里直连 sqlite 只改这一列。
+        走 conversation_manager 的公开接口：persona_id 传 SQLAlchemy 的 null()
+        表达式。它不是 None，能穿过 update_conversation 里
+        `if persona_id is not None` 的拦截，到 ORM 层生成
+        `SET persona_id = NULL`。结果与直接写库一致，但全程不碰数据库连接、
+        不依赖内部属性，也没有 LIKE 模糊更新。
         """
-        db = getattr(self.context.conversation_manager, "db", None)
-        db_path = getattr(db, "db_path", "") or ""
-        if not db_path:
-            return False
-        conn = sqlite3.connect(db_path, timeout=30)
+        conv_mgr = self.context.conversation_manager
         try:
-            cur = conn.execute(
-                "UPDATE conversations SET persona_id = NULL WHERE conversation_id = ?",
-                (cid,),
+            await conv_mgr.update_conversation(umo, cid, persona_id=null())
+            return True
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "[PersonaRouter] 解绑对话 %s 失败: %s", str(cid)[:8], exc
             )
-            if cur.rowcount <= 0:
-                cur = conn.execute(
-                    "UPDATE conversations SET persona_id = NULL" " WHERE conversation_id LIKE ?",
-                    (f"{cid}%",),
-                )
-            conn.commit()
-            return cur.rowcount > 0
-        finally:
-            conn.close()
+            return False
 
     async def _release_persona_bindings(self) -> tuple[int, int]:
         """把所有会话的指针拨回主对话，并解掉主对话的人格绑定。
@@ -1601,7 +1595,7 @@ class PersonaRouterPlugin(Star):
                         str(target.cid)[:8],
                     )
                 if (target.persona_id or "").strip():
-                    if self._unbind_persona(str(target.cid)):
+                    if await self._unbind_persona(umo, str(target.cid)):
                         changed = True
                         logger.info(
                             "[PersonaRouter] 会话不归本插件管，解绑主对话 umo=%s cid=%s 原人格=%s",
@@ -1619,7 +1613,7 @@ class PersonaRouterPlugin(Star):
             conv = await conv_mgr.get_conversation(umo, cid)
             if not conv or not (conv.persona_id or "").strip():
                 return False
-            if self._unbind_persona(str(cid)):
+            if await self._unbind_persona(umo, str(cid)):
                 logger.info(
                     "[PersonaRouter] 会话不归本插件管，解绑当前对话 umo=%s cid=%s 原人格=%s",
                     umo,

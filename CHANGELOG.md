@@ -1,11 +1,21 @@
 # 更新日志
 
+## v2.5.8
+
+### 修正
+
+- 插件列表里显示的版本号此前停在 `2.5.4`：`@register` 装饰器的第四个参数是写死的字符串，之前没有跟着 `metadata.yaml` 一起改。现已同步
+
+### 说明
+
+- `v2.5.7` 已用于上架提交，本版仅同步版本号字符串，功能与 `v2.5.7` 完全一致
+
+
 ## v2.5.7
 
 ### 修复
 
 - 解绑人格不再直连数据库。`_unbind_persona` 原先通过 `conversation_manager.db.db_path` 自己开 `sqlite3` 连接执行 `UPDATE conversations SET persona_id = NULL`，还带一条 `LIKE` 模糊兜底。现在改走 `update_conversation(persona_id=null())` 公开接口：`null()` 不是 `None`，能穿过实现里 `if persona_id is not None` 的拦截，由 AstrBot 自己的 ORM 生成同样的 `SET persona_id = NULL`。结果与原来一致，但全程不碰数据库连接、不依赖内部属性、也没有模糊更新，顺带修掉了同步 `sqlite3.connect(timeout=30)` 阻塞事件循环的隐患
-- 修正：`@register` 装饰器里的版本号字符串仍写着 `2.5.4`，现已同步到 `2.5.7`，插件列表里显示的就是实际版本
 
 ### 说明
 

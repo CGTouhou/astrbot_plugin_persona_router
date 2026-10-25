@@ -167,7 +167,7 @@ class CachedDecision:
     "astrbot_plugin_persona_router",
     "CGTouhou",
     "按聊天内容自动切换人格，每个人格各自拥有独立的聊天记录。",
-    "2.5.4",
+    "2.5.7",
 )
 class PersonaRouterPlugin(Star):
     """动态人格增强：自动选人格 + 人格上下文隔离。"""

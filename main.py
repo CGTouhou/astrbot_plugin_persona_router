@@ -167,7 +167,7 @@ class CachedDecision:
     "astrbot_plugin_persona_router",
     "CGTouhou",
     "按聊天内容自动切换人格，每个人格各自拥有独立的聊天记录。",
-    "2.5.11",
+    "2.5.12",
 )
 class PersonaRouterPlugin(Star):
     """动态人格增强：自动选人格 + 人格上下文隔离。"""
@@ -218,10 +218,21 @@ class PersonaRouterPlugin(Star):
                 "、".join(missing),
             )
         # 把上次的时间线读回来，重启后 Selector 不会从零开始
-        await self._load_timeline()
+        try:
+            await self._load_timeline()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("[PersonaRouter] 加载时间线失败，从空时间线开始: %s", exc)
         # 启动对账：把上次接管过、这次配置改成不再管辖的会话解绑，
         # 否则那些会话的人格会卡在插件最后写下的 persona_id 上。
-        await self._reconcile_bindings()
+        # 对账失败不能连累插件加载——否则一条脏数据会让整个插件起不来。
+        try:
+            await self._reconcile_bindings()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error("[PersonaRouter] 启动对账失败，跳过本次对账: %s", exc, exc_info=True)
 
     # ---------------- 主钩子：选人格 + 切对话 ----------------
     @filter.on_waiting_llm_request(priority=_HOOK_PRIORITY)

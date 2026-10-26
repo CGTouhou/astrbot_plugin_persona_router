@@ -167,7 +167,7 @@ class CachedDecision:
     "astrbot_plugin_persona_router",
     "CGTouhou",
     "按聊天内容自动切换人格，每个人格各自拥有独立的聊天记录。",
-    "2.5.9",
+    "2.5.10",
 )
 class PersonaRouterPlugin(Star):
     """动态人格增强：自动选人格 + 人格上下文隔离。"""
@@ -1636,23 +1636,17 @@ class PersonaRouterPlugin(Star):
                         )
                 return changed
 
-            # 没有主对话（历史全被插件建的人格对话占着）：新建一条空的
-            # 主对话，把指针拨过去。人格对话的绑定必须原样保留——解绑它们
+            # 没有主对话（历史全被插件建的人格对话占着）：指针原地不动。
+            # terminate 时新建空主对话会把指针拨离人格对话，下次接管时历史
+            # 就接不上了；这里保留现状，由 _reconcile_bindings 在启动时把
+            # 指针拨回最近的非空对话。人格对话的绑定必须原样保留——解绑它们
             # 会制造「标题在、persona_id 空」的矛盾态，下次接管时既不知道
             # 历史属于谁，也不知道 AstrBot 当时注入的是谁。
-            try:
-                new_cid = await conv_mgr.new_conversation(umo)
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                logger.warning("[PersonaRouter] 创建主对话失败 umo=%s: %s", umo, exc)
-                return False
             logger.info(
-                "[PersonaRouter] 会话不归本插件管，新建主对话 umo=%s cid=%s",
+                "[PersonaRouter] 会话不归本插件管，保留当前对话 umo=%s",
                 umo,
-                str(new_cid)[:8],
             )
-            return True
+            return False
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -1711,6 +1705,59 @@ class PersonaRouterPlugin(Star):
             logger.info(
                 "[PersonaRouter] 启动对账：%d 条会话的人格绑定已修复",
                 repaired,
+            )
+
+        # 修复指针：旧 terminate 会新建空主对话并把指针拨过去，导致历史对话
+        # 还在库里、用户却对着一句「新对话」。把指针拨回该会话最近的非空
+        # 对话，并删掉那条空壳。
+        by_umo: dict[str, list[Any]] = {}
+        for conv in conversations:
+            umo = str(conv.user_id or "")
+            if umo.strip():
+                by_umo.setdefault(umo, []).append(conv)
+        fixed_ptrs = 0
+        for umo, convs in by_umo.items():
+            if not self._session_allowed_by_umo(umo):
+                continue
+            curr_cid = await conv_mgr.get_curr_conversation_id(umo)
+            curr = next((c for c in convs if str(c.cid) == str(curr_cid)), None)
+            if curr is None:
+                continue
+            if len(curr.history or "[]") > 2:
+                continue
+            others = [
+                c
+                for c in convs
+                if str(c.cid) != str(curr_cid)
+                and ((c.title or "").strip() or (c.persona_id or "").strip())
+            ]
+            if not others:
+                continue
+            # 优先挑有历史的对话，别把指针从一个空壳拨到另一个空壳
+            non_empty = [c for c in others if len(c.history or "[]") > 2]
+            best = max(non_empty or others, key=lambda c: c.updated_at or 0)
+            try:
+                await conv_mgr.switch_conversation(umo, best.cid)
+                if not (curr.title or "").strip() and not (curr.persona_id or "").strip():
+                    await conv_mgr.delete_conversation(umo, curr.cid)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "[PersonaRouter] 启动对账：修复 %s 的指针失败: %s", umo, exc
+                )
+                continue
+            fixed_ptrs += 1
+            logger.info(
+                "[PersonaRouter] 启动对账：指针拨回非空对话 umo=%s cid=%s（空壳 %s）",
+                umo,
+                str(best.cid)[:8],
+                str(curr.cid)[:8],
+            )
+        if fixed_ptrs:
+            logger.info(
+                "[PersonaRouter] 启动对账：%d 个会话的指针已拨回非空对话",
+                fixed_ptrs,
             )
 
     # ---------------- 管理命令 ----------------

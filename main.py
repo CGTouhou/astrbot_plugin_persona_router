@@ -167,7 +167,7 @@ class CachedDecision:
     "astrbot_plugin_persona_router",
     "CGTouhou",
     "按聊天内容自动切换人格，每个人格各自拥有独立的聊天记录。",
-    "2.5.8",
+    "2.5.9",
 )
 class PersonaRouterPlugin(Star):
     """动态人格增强：自动选人格 + 人格上下文隔离。"""
@@ -1270,15 +1270,51 @@ class PersonaRouterPlugin(Star):
 
     @staticmethod
     def _conversation_belongs(conv: Any, persona_id: str) -> bool:
-        """判断一条对话是否属于某个人格。
+        """运行时绑定是否指向某人格。
 
-        两层锚：`persona_id` 是活绑定，`title == "[人格名]"` 是永久铭牌。
-        插件退出管辖时会抹掉当前对话的 persona_id，但人格对话的 title 永远
-        保留，这样插件重新接管、判回同一人格时还能把那段历史找回来。
+        AstrBot 解析人格只认 `conversation.persona_id`；title 只是显示铭牌，
+        不能代替绑定。把两者混为一谈，「标题在、绑定被清」的对话就会被误判
+        为已绑定，实际注入的却是全局默认人格。
         """
-        if (conv.persona_id or "") == persona_id:
-            return True
+        return (conv.persona_id or "") == persona_id
+
+    @staticmethod
+    def _conversation_labelled(conv: Any, persona_id: str) -> bool:
+        """标题铭牌是否指向某人格（只用于找回历史，不代表绑定有效）。"""
         return (conv.title or "").strip() == f"[{persona_id}]"
+
+    async def _ensure_bound(self, umo: str, conv: Any, persona_id: str) -> Any:
+        """把找回的对话重新绑定到目标人格，并补齐铭牌。
+
+        title 匹配只说明「这条历史属于该人格」，不说明 AstrBot 会注入它；
+        必须把 persona_id 写回去，否则请求会回落到全局默认人格。
+        """
+        conv_mgr = self.context.conversation_manager
+        try:
+            if (conv.persona_id or "") == persona_id and (conv.title or "").strip():
+                return conv
+            await conv_mgr.update_conversation(
+                umo,
+                conv.cid,
+                persona_id=persona_id,
+                title=f"[{persona_id}]",
+            )
+            conv.persona_id = persona_id
+            conv.title = f"[{persona_id}]"
+            logger.info(
+                "[PersonaRouter] 恢复人格绑定 persona=%s cid=%s",
+                persona_id,
+                str(conv.cid)[:8],
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "[PersonaRouter] 恢复人格绑定失败 cid=%s: %s",
+                str(conv.cid)[:8],
+                exc,
+            )
+        return conv
 
     async def _ensure_persona_conversation(
         self, event: AstrMessageEvent, umo: str, persona_id: str
@@ -1290,35 +1326,23 @@ class PersonaRouterPlugin(Star):
         if curr_cid:
             current = await conv_mgr.get_conversation(umo, curr_cid)
             if current is not None and self._conversation_belongs(current, persona_id):
-                # /new 建出来的对话会继承当前人格的 persona_id（AstrBot 的
-                # _get_current_persona_id 直接返回 conv.persona_id），但没有
-                # title。补上铭牌，否则它在插件眼里是「主对话」，插件退场时
-                # _release_umo_binding 会把它当候选，把会话指针拨来拨去。
-                # 只补空对话：有历史的主对话要继续保持无标题，退场时靠
-                # title 为空把它认出来，把指针拨回去。
-                if not (current.title or "").strip() and not self._history_as_list(
-                    current.history
-                ):
-                    try:
-                        await conv_mgr.update_conversation(
-                            umo, current.cid, title=f"[{persona_id}]"
-                        )
-                        current.title = f"[{persona_id}]"
-                        logger.info(
-                            "[PersonaRouter] 补齐对话铭牌 persona=%s cid=%s",
-                            persona_id,
-                            str(current.cid)[:8],
-                        )
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception as exc:
-                        logger.warning("[PersonaRouter] 补齐对话铭牌失败: %s", exc)
-                return current
+                # /new 建出来的对话会继承当前人格的 persona_id，但没有 title。
+                # 退场判定「主对话」看的是「无标题且无绑定」，只补绑定不补
+                # 铭牌，它就会被误当成原生主对话解绑掉，所以这里一并补齐。
+                return await self._ensure_bound(umo, current, persona_id)
         conversations = await conv_mgr.get_conversations(umo)
-        matched = [c for c in conversations if self._conversation_belongs(c, persona_id)]
+        matched = [
+            c
+            for c in conversations
+            if self._conversation_belongs(c, persona_id)
+            or self._conversation_labelled(c, persona_id)
+        ]
         if matched:
-            # 同一人格可能有多条（用户手动 /new 过），取最近更新的那条
-            return max(matched, key=lambda c: c.updated_at or 0)
+            # 同一人格可能有多条（用户手动 /new 过），取最近更新的那条。
+            # 标题对得上但绑定被清过的是「矛盾态」：必须补写 persona_id，
+            # 否则复用它之后 AstrBot 仍会注入全局默认人格。
+            best = max(matched, key=lambda c: c.updated_at or 0)
+            return await self._ensure_bound(umo, best, persona_id)
         if self.config.get("claim_legacy_conversation", True):
             # 只认领「完全无主」的对话：persona_id 为空、title 也为空。
             # title 非空的都是本插件建的（`[人格名]` / `[共享]`），它们的主人
@@ -1571,9 +1595,10 @@ class PersonaRouterPlugin(Star):
     async def _release_umo_binding(self, umo: str) -> bool:
         """让会话脱离插件管辖：指针拨回主对话，并解掉主对话的人格绑定。
 
-        只动主对话（title 为空、AstrBot 原生创建的那条）。人格专属对话一律
-        不碰——它们的 title 是 `[人格名]`，是「人格 ↔ 历史」的永久锚点，插件
-        重新接管时靠它把对话找回来。解绑只抹 persona_id 一列，历史一个字不动。
+        只动主对话（无标题且无绑定，AstrBot 原生创建的那条）。人格专属对话
+        一律不碰——它们的 title 是 `[人格名]`，是「人格 ↔ 历史」的永久锚点，
+        插件重新接管时靠它把对话找回来。解绑只抹 persona_id 一列，历史一个字
+        不动。会话里根本没有主对话时，新建一条空主对话再拨过去。
         """
         conv_mgr = self.context.conversation_manager
         try:
@@ -1581,7 +1606,13 @@ class PersonaRouterPlugin(Star):
             if not conversations:
                 return False
 
-            mains = [c for c in conversations if not (c.title or "").strip()]
+            # 主对话 = AstrBot 原生建的那条：无标题、无绑定。只看标题会把
+            # /new 出来的「有绑定无标题」对话误当成主对话，把它解绑。
+            mains = [
+                c
+                for c in conversations
+                if not (c.title or "").strip() and not (c.persona_id or "").strip()
+            ]
             if mains:
                 target = max(mains, key=lambda c: c.updated_at or 0)
                 changed = False
@@ -1605,23 +1636,23 @@ class PersonaRouterPlugin(Star):
                         )
                 return changed
 
-            # 没有主对话（历史全被插件建的人格对话占着）时，退化成解绑当前
-            # 对话，至少保证人格不会被钉死。
-            cid = await conv_mgr.get_curr_conversation_id(umo)
-            if not cid:
+            # 没有主对话（历史全被插件建的人格对话占着）：新建一条空的
+            # 主对话，把指针拨过去。人格对话的绑定必须原样保留——解绑它们
+            # 会制造「标题在、persona_id 空」的矛盾态，下次接管时既不知道
+            # 历史属于谁，也不知道 AstrBot 当时注入的是谁。
+            try:
+                new_cid = await conv_mgr.new_conversation(umo)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning("[PersonaRouter] 创建主对话失败 umo=%s: %s", umo, exc)
                 return False
-            conv = await conv_mgr.get_conversation(umo, cid)
-            if not conv or not (conv.persona_id or "").strip():
-                return False
-            if await self._unbind_persona(umo, str(cid)):
-                logger.info(
-                    "[PersonaRouter] 会话不归本插件管，解绑当前对话 umo=%s cid=%s 原人格=%s",
-                    umo,
-                    str(cid)[:8],
-                    conv.persona_id,
-                )
-                return True
-            return False
+            logger.info(
+                "[PersonaRouter] 会话不归本插件管，新建主对话 umo=%s cid=%s",
+                umo,
+                str(new_cid)[:8],
+            )
+            return True
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -1653,6 +1684,33 @@ class PersonaRouterPlugin(Star):
             logger.info(
                 "[PersonaRouter] 启动对账：%d 个不受管辖的会话已解绑人格绑定",
                 released,
+            )
+
+        # 修复存量：标题与绑定脱钩的会话。历史上插件退场时会把人格对话的
+        # persona_id 清成 NULL，只留下 title —— 这种「有铭牌、无绑定」的对话
+        # 一旦被复用，AstrBot 注入的就是全局默认人格，看着像插件没生效。
+        repaired = 0
+        for conv in conversations:
+            umo = str(conv.user_id or "")
+            if not umo.strip() or not self._session_allowed_by_umo(umo):
+                continue
+            title = (conv.title or "").strip()
+            persona = (conv.persona_id or "").strip()
+            if title.startswith("[") and title.endswith("]") and title != _SHARED_TITLE:
+                pid = title[1:-1].strip()
+                if pid and pid != persona and self._persona_exists(pid):
+                    fixed = await self._ensure_bound(umo, conv, pid)
+                    if (fixed.persona_id or "") == pid:
+                        repaired += 1
+                continue
+            if persona and not title and persona != "None":
+                fixed = await self._ensure_bound(umo, conv, persona)
+                if (fixed.persona_id or "") == persona:
+                    repaired += 1
+        if repaired:
+            logger.info(
+                "[PersonaRouter] 启动对账：%d 条会话的人格绑定已修复",
+                repaired,
             )
 
     # ---------------- 管理命令 ----------------
@@ -1865,7 +1923,9 @@ class PersonaRouterPlugin(Star):
     async def terminate(self):
         """插件停用 / 重载 / AstrBot 正常退出时调用。
 
-        把残留的人格对话绑定解绑，避免插件退场后会话卡在最后选中的人格上。
+        把会话指针拨回主对话（无标题、无绑定的那条），并解掉主对话上的
+        人格绑定；人格专属对话的绑定原样保留，作为「人格 ↔ 历史」的锚点，
+        下次接管时能原地找回。会话里没有主对话时新建一条空的再拨过去。
         覆盖不到的情况：强制杀进程、whitelist 排除——这两种要用 /dp restore。
         """
         self._persona_cache.clear()
@@ -1888,7 +1948,7 @@ class PersonaRouterPlugin(Star):
         try:
             released, total = await self._release_persona_bindings()
             logger.info(
-                "[PersonaRouter] terminate：扫描 %d 个会话，解绑 %d 条人格绑定",
+                "[PersonaRouter] terminate：扫描 %d 个会话，处理 %d 个会话的指针/绑定",
                 total,
                 released,
             )

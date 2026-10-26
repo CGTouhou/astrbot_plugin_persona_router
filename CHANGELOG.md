@@ -1,5 +1,16 @@
 # 更新日志
 
+## v2.5.9
+
+### 修复
+
+- **人格绑定与对话标题脱钩，选好的人格不生效**：插件退场时 `_release_umo_binding` 在「会话里没有主对话」的情况下会解绑当前的人格对话，把 `persona_id` 清成 `NULL` 但保留 `title`；而 `_conversation_belongs` 又把 `title == "[人格名]"` 也当成已绑定，重新接管时命中快路径直接复用，从不补写 `persona_id`。AstrBot 解析人格只认 `conversation.persona_id`，于是这些对话全部回落到全局默认人格——插件日志里 `persona_section=True` 看着一切正常，实际注入的却是默认卡。现改为：`_conversation_belongs` 只认运行时绑定，新增 `_conversation_labelled` 专门用于按标题找回历史，找回后统一由 `_ensure_bound` 补齐 `persona_id` 与标题铭牌
+
+### 改进
+
+- `_release_umo_binding` 的主对话判定改为「无标题且无绑定」，不再把 `/new` 出来的「有绑定无标题」对话误当主对话解绑；会话里没有主对话时新建一条空主对话，人格对话的绑定原样保留，作为「人格 ↔ 历史」的锚点
+- `_reconcile_bindings` 启动对账新增存量修复：`[人格名]` 标题与绑定不一致、或有绑定无标题的会话，自动重新对齐（只处理插件管辖的会话，人格名须真实存在）
+
 ## v2.5.8
 
 ### 修正

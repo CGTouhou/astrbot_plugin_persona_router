@@ -167,7 +167,7 @@ class CachedDecision:
     "astrbot_plugin_persona_router",
     "CGTouhou",
     "按聊天内容自动切换人格，每个人格各自拥有独立的聊天记录。",
-    "2.5.10",
+    "2.5.11",
 )
 class PersonaRouterPlugin(Star):
     """动态人格增强：自动选人格 + 人格上下文隔离。"""
@@ -603,31 +603,35 @@ class PersonaRouterPlugin(Star):
                         return rule, idx
         return None, -1
 
-    async def _has_forced_persona_binding(self, event: AstrMessageEvent) -> bool:
-        """WebUI 里手动给会话绑定人格时，让整个动态流程让路。"""
+    async def _umo_has_forced_binding(self, umo: str) -> bool:
+        """按 umo 判断 WebUI 是否给该会话手动绑定了人格。"""
         try:
             session_service_config = (
                 await sp.get_async(
                     scope="umo",
-                    scope_id=str(event.unified_msg_origin),
+                    scope_id=str(umo),
                     key="session_service_config",
                     default={},
                 )
                 or {}
             )
             persona_id = str(session_service_config.get("persona_id", "")).strip()
-            if persona_id and persona_id != "[%None]":
-                logger.debug(
-                    "[PersonaRouter] session %s forced to persona %s, skip",
-                    event.unified_msg_origin,
-                    persona_id,
-                )
-                return True
+            return bool(persona_id and persona_id != "[%None]")
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            logger.warning("[PersonaRouter] 检查强制人格失败，继续动态流程: %s", exc)
-        return False
+            logger.warning("[PersonaRouter] 检查强制人格失败，按未绑定处理: %s", exc)
+            return False
+
+    async def _has_forced_persona_binding(self, event: AstrMessageEvent) -> bool:
+        """WebUI 里手动给会话绑定人格时，让整个动态流程让路。"""
+        forced = await self._umo_has_forced_binding(event.unified_msg_origin)
+        if forced:
+            logger.debug(
+                "[PersonaRouter] session %s forced to persona, skip",
+                event.unified_msg_origin,
+            )
+        return forced
 
     async def _get_or_select_decision(
         self,
@@ -1554,10 +1558,12 @@ class PersonaRouterPlugin(Star):
             return False
 
     async def _release_persona_bindings(self) -> tuple[int, int]:
-        """把所有会话的指针拨回主对话，并解掉主对话的人格绑定。
+        """把所有会话的指针拨回主对话（即默认人格），并解掉主对话的人格绑定。
 
-        返回 (处理条数, 扫描会话数)。人格专属对话一律不碰，它们的 title 就是
-        `[人格名]`，插件重新接管时靠它把历史找回来。
+        返回 (处理条数, 扫描会话数)。只处理本插件管辖的会话——黑/白名单排掉
+        的不碰；WebUI 手动绑定人格的会话也不碰（交给用户）。人格专属对话的
+        绑定原样保留，它们的 title 就是 `[人格名]`，插件重新接管时靠它把历史
+        找回来。
         """
         conv_mgr = self.context.conversation_manager
         try:
@@ -1571,7 +1577,11 @@ class PersonaRouterPlugin(Star):
         umos = {conv.user_id for conv in conversations if (conv.user_id or "").strip()}
         released = 0
         for umo in umos:
-            if await self._release_umo_binding(umo):
+            # 不归本插件管的会话不碰：黑/白名单排掉的，本来就不该由插件
+            # 决定它停在哪个对话上。
+            if not self._session_allowed_by_umo(umo):
+                continue
+            if await self._release_umo_binding(umo, create_main=True):
                 released += 1
         return released, len(umos)
 
@@ -1592,14 +1602,21 @@ class PersonaRouterPlugin(Star):
         hit = any(umo == t or umo.endswith(":" + t) for t in targets)
         return hit if mode == "whitelist" else not hit
 
-    async def _release_umo_binding(self, umo: str) -> bool:
+    async def _release_umo_binding(self, umo: str, create_main: bool = False) -> bool:
         """让会话脱离插件管辖：指针拨回主对话，并解掉主对话的人格绑定。
 
         只动主对话（无标题且无绑定，AstrBot 原生创建的那条）。人格专属对话
         一律不碰——它们的 title 是 `[人格名]`，是「人格 ↔ 历史」的永久锚点，
         插件重新接管时靠它把对话找回来。解绑只抹 persona_id 一列，历史一个字
-        不动。会话里根本没有主对话时，新建一条空主对话再拨过去。
+        不动。
+
+        - WebUI 手动绑定人格的会话直接跳过（人格以绑定为准）。
+        - 没有主对话时：create_main=True（停用插件）新建一条空主对话并拨过去，
+          人格落回全局默认；create_main=False（运行时让路）原地不动。
         """
+        if await self._umo_has_forced_binding(umo):
+            logger.debug("[PersonaRouter] 会话 %s 有手动人格绑定，不释放", umo)
+            return False
         conv_mgr = self.context.conversation_manager
         try:
             conversations = await conv_mgr.get_conversations(umo)
@@ -1636,12 +1653,22 @@ class PersonaRouterPlugin(Star):
                         )
                 return changed
 
-            # 没有主对话（历史全被插件建的人格对话占着）：指针原地不动。
-            # terminate 时新建空主对话会把指针拨离人格对话，下次接管时历史
-            # 就接不上了；这里保留现状，由 _reconcile_bindings 在启动时把
-            # 指针拨回最近的非空对话。人格对话的绑定必须原样保留——解绑它们
-            # 会制造「标题在、persona_id 空」的矛盾态，下次接管时既不知道
-            # 历史属于谁，也不知道 AstrBot 当时注入的是谁。
+            # 没有主对话（历史全被插件建的人格对话占着）。
+            # - 停用（create_main=True）：新建一条空主对话并拨过去，人格落回
+            #   全局默认；历史仍在人格对话里，重新接管时由 _reconcile_bindings
+            #   把指针拨回最近的非空对话，不会重演「历史被空对话顶掉」。
+            # - 运行时让路（create_main=False）：原地不动，避免每条消息都切一次。
+            # 人格对话的绑定必须原样保留——解绑它们会制造「标题在、persona_id
+            # 空」的矛盾态，下次接管时既不知道历史属于谁，也不知道 AstrBot
+            # 当时注入的是谁。
+            if create_main:
+                new_conv = await conv_mgr.new_conversation(umo)
+                logger.info(
+                    "[PersonaRouter] 会话不归本插件管，新建主对话回默认人格 umo=%s cid=%s",
+                    umo,
+                    str(getattr(new_conv, "cid", new_conv) or "")[:8],
+                )
+                return True
             logger.info(
                 "[PersonaRouter] 会话不归本插件管，保留当前对话 umo=%s",
                 umo,
@@ -1719,7 +1746,15 @@ class PersonaRouterPlugin(Star):
         for umo, convs in by_umo.items():
             if not self._session_allowed_by_umo(umo):
                 continue
-            curr_cid = await conv_mgr.get_curr_conversation_id(umo)
+            try:
+                curr_cid = await conv_mgr.get_curr_conversation_id(umo)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "[PersonaRouter] 启动对账：读取 %s 的当前对话失败: %s", umo, exc
+                )
+                continue
             curr = next((c for c in convs if str(c.cid) == str(curr_cid)), None)
             if curr is None:
                 continue
@@ -1729,6 +1764,7 @@ class PersonaRouterPlugin(Star):
                 c
                 for c in convs
                 if str(c.cid) != str(curr_cid)
+                and (c.title or "").strip() != _SHARED_TITLE
                 and ((c.title or "").strip() or (c.persona_id or "").strip())
             ]
             if not others:
@@ -1970,10 +2006,12 @@ class PersonaRouterPlugin(Star):
     async def terminate(self):
         """插件停用 / 重载 / AstrBot 正常退出时调用。
 
-        把会话指针拨回主对话（无标题、无绑定的那条），并解掉主对话上的
-        人格绑定；人格专属对话的绑定原样保留，作为「人格 ↔ 历史」的锚点，
-        下次接管时能原地找回。会话里没有主对话时新建一条空的再拨过去。
-        覆盖不到的情况：强制杀进程、whitelist 排除——这两种要用 /dp restore。
+        把本插件管辖的会话指针拨回主对话（无标题、无绑定的那条 = 全局默认
+        人格），并解掉主对话上的人格绑定；没有主对话时新建一条空的再拨过去。
+        人格专属对话的绑定原样保留，作为「人格 ↔ 历史」的锚点，下次接管时
+        由 _reconcile_bindings 把指针拨回历史。黑/白名单排掉的、WebUI 手动
+        绑定人格的会话一律不碰。
+        覆盖不到的情况：强制杀进程 —— 这种要用 /dp restore。
         """
         self._persona_cache.clear()
         # 取消还没到点的延迟写盘任务，避免退出时留下 pending task

@@ -1,5 +1,27 @@
 # 更新日志
 
+## v2.5.14
+
+### 修正
+
+- `@register` 装饰器里的版本号字符串又落后了：`metadata.yaml` 已是 `2.5.13`，装饰器还写着 `2.5.12`，插件列表里会显示错误的版本。现已同步为 `2.5.14`
+
+### 修复
+
+- `_ensure_conversation` 兜底补 `contexts` 时用的是裸 `json.loads(conv.history)`。如果库里存着双重编码的 `'"[]"'`（v2.5.5 之前的历史遗留），`json.loads` 一次拿到的还是 `str`，会被原样塞进 `req.contexts`，AstrBot 读到 `str` 会报错。现在改用插件自己的 `_history_as_list()`，与其它搬历史的地方保持一致
+
+## v2.5.13
+
+### 新增
+
+- `isolate_context: true`（隔离模式）下的人格丢失兜底：某些插件通过 `event.request_llm()` 构造的请求不带 `conversation`，AstrBot 的 `_ensure_persona_and_skills()` 会在 `if not req.conversation: return` 处提前退出，人格段整段被跳过，表现为「群里回话但完全是路人语气」
+- 新增 `_ensure_conversation(event, req, expect_persona)`：查当前对话 → 校验对话人格与路由人格一致 → 补 `req.conversation` → `contexts` 为空时补历史。三重防护：人格不一致不补、只填空 `contexts`、异常时静默返回 False
+- `on_llm_request` 新增 `elif state.get("persona_id") and req.conversation is None:` 分支，用 `prepend` 模式补注入，`# Persona Instructions` 已在 `system_prompt` 里时跳过
+
+### 说明
+
+- 这是**兜底**不是正解。真正该修的是造裸请求的插件——它调 `request_llm()` 时应当自己带上 `conversation`。此版本让用户不必等上游修好
+
 ## v2.5.12
 
 ### 修复

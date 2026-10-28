@@ -167,7 +167,7 @@ class CachedDecision:
     "astrbot_plugin_persona_router",
     "CGTouhou",
     "按聊天内容自动切换人格，每个人格各自拥有独立的聊天记录。",
-    "2.5.12",
+    "2.5.14",
 )
 class PersonaRouterPlugin(Star):
     """动态人格增强：自动选人格 + 人格上下文隔离。"""
@@ -267,6 +267,55 @@ class PersonaRouterPlugin(Star):
             # 分支也照样把用户这句话记进来，时间线才不会缺口气。
             self._record_timeline(umo, "user", event.message_str)
 
+    async def _ensure_conversation(
+        self,
+        event: AstrMessageEvent,
+        req: ProviderRequest,
+        expect_persona: str,
+    ) -> bool:
+        """兜底补 conversation。
+
+        某些插件（如 chat_plus）通过 event.request_llm() 构造的请求不带
+        conversation，框架的 _ensure_persona_and_skills 会提前 return，
+        导致人格段整段丢失。这里补一个，失败返回 False 不抛异常。
+        """
+        if req.conversation is not None:
+            return True
+        try:
+            manager = self.context.conversation_manager
+            umo = event.unified_msg_origin
+            cid = await manager.get_curr_conversation_id(umo)
+            if not cid:
+                return False
+            conv = await manager.get_conversation(umo, cid)
+            if conv is None:
+                return False
+            # 防 3：对话人格和当前路由的人格不一致，就别硬补
+            conv_pid = str(getattr(conv, "persona_id", "") or "")
+            if conv_pid and expect_persona and conv_pid != expect_persona:
+                logger.info(
+                    "[PersonaRouter] 兜底跳过：对话人格 %r != 路由人格 %r",
+                    conv_pid,
+                    expect_persona,
+                )
+                return False
+            req.conversation = conv
+            # 防 1：只在 contexts 为空时补，别冲掉插件自己造的上下文
+            if not req.contexts:
+                # 用 _history_as_list 而不是裸 json.loads：库里可能存着
+                # 双重编码的 '"[]"'，裸 loads 一次拿到的还是 str
+                req.contexts = self._history_as_list(conv.history)
+            logger.info(
+                "[PersonaRouter] 兜底补齐 conversation cid=%s persona=%s contexts=%d",
+                cid,
+                conv_pid or "-",
+                len(req.contexts or []),
+            )
+            return True
+        except Exception as exc:
+            logger.warning("[PersonaRouter] 兜底补 conversation 失败：%s", exc)
+            return False
+
     # ---------------- LLM 请求阶段：补 model + 诊断 ----------------
     @filter.on_llm_request(priority=_DIAG_PRIORITY)
     async def on_llm_request(self, event: AstrMessageEvent, req: ProviderRequest):
@@ -282,6 +331,22 @@ class PersonaRouterPlugin(Star):
                 layers = await self._inject_persona_prompt(event, req, state["persona_id"], mode)
                 if layers:
                     injected = "plugin"
+            elif state.get("persona_id") and req.conversation is None:
+                # 兜底：隔离模式下，如果请求没有 conversation（插件用 request_llm()
+                # 造的裸请求），框架的 _ensure_persona_and_skills 会提前 return，
+                # 人格段整段丢失。这里补 conversation，再补注入人格。
+                persona_id = state["persona_id"]
+                if await self._ensure_conversation(event, req, persona_id):
+                    if "# Persona Instructions" not in (req.system_prompt or ""):
+                        # 这里固定用 prepend，不看用户配的 inject_mode：能走到
+                        # 这个分支说明请求是别的插件造的，system_prompt 里可能
+                        # 已经有它自己的场景描述/工具约定，replace 会整段覆盖掉。
+                        # 叠加最安全，重复由上面那个 in 检查兜住。
+                        layers = await self._inject_persona_prompt(
+                            event, req, persona_id, mode="prepend"
+                        )
+                        if layers:
+                            injected = "plugin"
         if not self.config.get("diagnose_prompt", True):
             return
         try:

@@ -8,7 +8,7 @@
 
 | | |
 |---|---|
-| 当前版本 | `v2.5.8` |
+| 当前版本 | `v2.5.14` |
 | 需要 AstrBot | `>= 4.25.6` |
 | 支持平台 | QQ 个人号（aiocqhttp）/ QQ 官方机器人 |
 | 问题反馈 | **2898886368@qq.com** |
@@ -354,6 +354,17 @@ AstrBot 原生注入是在系统提示词后面追加一段 `# Persona Instructi
 ---
 
 ## 更新日志
+
+### v2.5.14
+
+- 修正：插件注册信息里的版本号字符串又落后了（写着 `2.5.12`，`metadata.yaml` 已是 `2.5.13`），插件列表会显示错误版本，现已同步
+- 修复：兜底补 `contexts` 时改用插件自己的 `_history_as_list()`。若库里存着双重编码的旧历史（`'"[]"'`），裸 `json.loads` 拿到的仍是字符串，塞进 `req.contexts` 会让 AstrBot 报错
+
+### v2.5.13
+
+- 新增：隔离模式下的人格丢失兜底。某些插件用 `event.request_llm()` 造裸请求（不带 `conversation`）时，AstrBot 的 `_ensure_persona_and_skills()` 会提前退出、人格段整段丢失，表现为「群里回话但完全是路人语气」
+- 新增 `_ensure_conversation()`：查当前对话 → 校验人格一致 → 补 `conversation` → `contexts` 为空时补历史。三重防护：人格不一致不补、只填空 `contexts`、异常静默返回
+- 说明：这是兜底不是正解，真正该修的是造裸请求的插件
 
 ### v2.5.8
 

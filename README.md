@@ -366,6 +366,8 @@ AstrBot 原生注入是在系统提示词后面追加一段 `# Persona Instructi
 - 新增 `_ensure_conversation()`：查当前对话 → 校验人格一致 → 补 `conversation` → `contexts` 为空时补历史。三重防护：人格不一致不补、只填空 `contexts`、异常静默返回
 - 说明：这是兜底不是正解，真正该修的是造裸请求的插件
 
+> `v2.5.9` ~ `v2.5.12` 的详细改动见 [CHANGELOG.md](CHANGELOG.md)
+
 ### v2.5.8
 
 - 修正：插件列表里显示的版本号此前一直停在 `2.5.4`（插件注册信息里写死的字符串没跟着更新），现在与 `metadata.yaml` 一致
